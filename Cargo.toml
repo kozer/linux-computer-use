@@ -45,6 +45,10 @@ path = "src/bin/computer-use-linux-cosmic.rs"
 name = "computer-use-linux-indicator"
 path = "src/bin/computer-use-linux-indicator/main.rs"
 
+[[bin]]
+name = "niri-clipboard"
+path = "src/bin/niri-clipboard.rs"
+
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.102"
@@ -83,6 +87,7 @@ wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+wl-clipboard-rs = "0.9.3"
 # Pure-Rust X11 client (no libxcb). Native X11 sessions only: absolute window
 # origins for the EWMH backend (wmctrl -lG counts the frame offset twice, #157).
 x11rb = { version = "0.14", features = ["xinput", "xkb", "xtest"] }

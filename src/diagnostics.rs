@@ -133,6 +133,7 @@ pub struct PlatformReport {
     /// The DMS shell's `dms screenshot all` route, tried first on Umbriel
     /// sessions because their portal captures one output.
     pub dms_screenshot: Check,
+    pub grim: Check,
     /// Native X11 display for the root-window screenshot route. Fails on
     /// Wayland sessions, including XWayland, by design.
     pub x11_display: Check,
@@ -176,6 +177,7 @@ pub struct WindowingReport {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct InputReport {
+    pub virtual_pointer: Check,
     pub ydotool: Check,
     pub ydotoold: Check,
     pub ydotool_socket: Check,
@@ -220,6 +222,7 @@ pub enum ScreenshotCaptureStatus {
     Failed,
 }
 
+const SCREENSHOT_UNAVAILABLE_NIRI: &str = "No screenshot route was detected: niri capture requires grim. Install grim and ensure it can connect to the current Wayland session; do not substitute the fractionally mis-scaled GNOME Screenshot compatibility route.";
 const SCREENSHOT_UNAVAILABLE: &str = "No screenshot route was detected: GNOME Shell is absent, the XDG portal does not export org.freedesktop.portal.Screenshot, this is not a native X11 session, and gnome-screenshot is not installed. get_app_state and screenshot return no image; element-aware actions from the accessibility tree still work.";
 const SCREENSHOT_UNVERIFIED: &str = "Screenshot routes were detected, but capture is unverified. Doctor does not take a screenshot or check screenshot consent. GNOME Shell can reject callers, and a portal may require consent for the caller's app ID. Call screenshot or get_app_state to verify capture.";
 const SCREENSHOT_MISSING_GNOME_FALLBACK: &str = "gnome-screenshot is not installed. On GNOME it provides a fallback when Shell or portal calls are denied; install it or inspect the desktop portal logs and screenshot permissions for the actual caller.";
@@ -240,7 +243,11 @@ impl ReadinessReport {
             warning != SCREENSHOT_UNVERIFIED && warning != SCREENSHOT_MISSING_GNOME_FALLBACK
         });
         self.blockers
-            .retain(|blocker| blocker != SCREENSHOT_UNAVAILABLE && blocker != SCREENSHOT_FAILED);
+            .retain(|blocker| {
+                blocker != SCREENSHOT_UNAVAILABLE
+                    && blocker != SCREENSHOT_UNAVAILABLE_NIRI
+                    && blocker != SCREENSHOT_FAILED
+            });
         if !succeeded {
             self.blockers.push(SCREENSHOT_FAILED.to_string());
         }
@@ -360,8 +367,17 @@ fn capability_map_with_portal_keyboard(
     if input.pixelflux.ok {
         input_backends.push("pixelflux".to_string());
     }
+    if is_niri_platform(platform) && input.virtual_pointer.ok {
+        input_backends.push("niri_virtual_pointer".into());
+        if input.uinput.ok {
+            input_backends.push("uinput_keyboard".into());
+        }
+    }
     // Absolute uinput pointer: accurate, non-blocking of coordinates; preferred.
-    if input.uinput.ok && platform_is_wayland(platform) && !is_cosmic_wayland_platform(platform) {
+    if input.uinput.ok && platform_is_wayland(platform)
+        && !is_cosmic_wayland_platform(platform)
+        && !is_niri_platform(platform)
+    {
         input_backends.push("abs_pointer".to_string());
     }
     let force_ydotool = env_flag_enabled_any(FORCE_YDOTOOL_KEYBOARD_ENV_KEYS);
@@ -853,6 +869,7 @@ fn platform_report() -> PlatformReport {
         gnome_shell_version: command_check("gnome-shell", &["--version"]),
         gnome_screenshot: command_check("gnome-screenshot", &["--version"]),
         dms_screenshot: dms_screenshot_check(),
+        grim: command_path_check("grim"),
         x11_display: x11_display_check(),
     }
 }
@@ -991,6 +1008,10 @@ fn pixelflux_check() -> Check {
 
 fn input_report() -> InputReport {
     InputReport {
+        virtual_pointer: match crate::niri_pointer::available() {
+            Ok(()) => Check::ok("Wayland virtual-pointer manager available"),
+            Err(error) => Check::fail(error.to_string()),
+        },
         ydotool: match ydotool::ensure_supported() {
             Ok(support) => Check::ok(support.detail),
             Err(detail) => Check::fail(detail),
@@ -1029,6 +1050,13 @@ fn screenshot_backends(
     portals: &PortalReport,
     input: &InputReport,
 ) -> Vec<String> {
+    if is_niri_platform(platform) {
+        return if platform.grim.ok {
+            vec!["grim".into()]
+        } else {
+            Vec::new()
+        };
+    }
     let mut backends = Vec::new();
     if input.pixelflux.ok {
         backends.push("pixelflux".to_string());
@@ -1092,10 +1120,16 @@ fn readiness_report_with_portal_keyboard(
     }
 
     if !can_send_development_input {
-        blockers.push(
+        blockers.push(if is_niri_platform(platform) {
+            "niri input requires its Wayland virtual-pointer protocol, read/write /dev/uinput for the native keyboard, and wtype for Unicode text. Check the current session, udev user access, and installed wtype.".into()
+        } else {
             "Development keyboard input is unavailable; enable XDG RemoteDesktop portal input or install wtype on compatible Wayland compositors, install xdotool with DISPLAY on X11, or use ydotool with a connectable ydotoold socket. Read/write /dev/uinput alone provides only absolute pointer input."
-                .to_string(),
-        );
+                .to_string()
+        });
+    }
+    if is_niri_platform(platform) && !input.virtual_pointer.ok {
+        blockers
+            .push("niri Wayland virtual-pointer protocol is unavailable in this session.".into());
     }
 
     if screenshot_routes_detected {
@@ -1104,7 +1138,11 @@ fn readiness_report_with_portal_keyboard(
             warnings.push(SCREENSHOT_MISSING_GNOME_FALLBACK.to_string());
         }
     } else {
-        blockers.push(SCREENSHOT_UNAVAILABLE.to_string());
+        blockers.push(if is_niri_platform(platform) {
+            SCREENSHOT_UNAVAILABLE_NIRI.to_string()
+        } else {
+            SCREENSHOT_UNAVAILABLE.to_string()
+        });
     }
 
     let recommended_next_step = if !can_build_accessibility_tree {
@@ -1122,11 +1160,17 @@ fn readiness_report_with_portal_keyboard(
     } else if !can_focus_windows {
         "Enable an exact-focus window backend before using window_id, title, or terminal-targeted input.".to_string()
     } else if !can_send_development_input {
-        "Enable a keyboard-capable input backend: enable the XDG RemoteDesktop portal or install wtype on compatible Wayland compositors, install xdotool for X11, or start ydotoold with a socket accessible to this desktop user."
-            .to_string()
+        if is_niri_platform(platform) {
+            "Enable niri's virtual-pointer protocol, user read/write access to /dev/uinput, and wtype.".to_string()
+        } else {
+            "Enable a keyboard-capable input backend: enable the XDG RemoteDesktop portal or install wtype on compatible Wayland compositors, install xdotool for X11, or start ydotoold with a socket accessible to this desktop user.".to_string()
+        }
     } else if !screenshot_routes_detected {
-        "Enable a screenshot route: install an XDG desktop portal backend that implements Screenshot for this desktop, or install gnome-screenshot. Accessibility-tree actions work meanwhile."
-            .to_string()
+        if is_niri_platform(platform) {
+            "Enable a screenshot route: install grim and verify access to the current niri Wayland session.".to_string()
+        } else {
+            "Enable a screenshot route: install an XDG desktop portal backend that implements Screenshot for this desktop, or install gnome-screenshot. Accessibility-tree actions work meanwhile.".to_string()
+        }
     } else {
         "AT-SPI tree support, window targeting, and a Linux input backend are available. Call screenshot or get_app_state to verify screenshot capture."
             .to_string()
@@ -1156,6 +1200,9 @@ fn can_send_development_input(
     remote_desktop_keyboard: &Check,
     input: &InputReport,
 ) -> bool {
+    if is_niri_platform(platform) {
+        return input.virtual_pointer.ok && input.uinput.ok && input.wtype.ok;
+    }
     let force_ydotool = env_flag_enabled_any(FORCE_YDOTOOL_KEYBOARD_ENV_KEYS);
     let force_xdotool = env_flag_enabled_any(FORCE_XDOTOOL_KEYBOARD_ENV_KEYS);
     input.pixelflux.ok
@@ -1177,6 +1224,13 @@ fn portal_keyboard_input_available(
     remote_desktop_keyboard: &Check,
 ) -> bool {
     platform_is_wayland(platform) && remote_desktop_keyboard.ok
+}
+
+fn is_niri_platform(platform: &PlatformReport) -> bool {
+    platform
+        .xdg_current_desktop
+        .as_deref()
+        .is_some_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("niri")))
 }
 
 fn is_cosmic_wayland_platform(platform: &PlatformReport) -> bool {
@@ -2010,6 +2064,7 @@ pub(crate) mod tests {
             gnome_shell_version: Check::ok("GNOME Shell 46.0"),
             gnome_screenshot: Check::ok("gnome-screenshot 41.0"),
             dms_screenshot: Check::fail("not an Umbriel session"),
+            grim: Check::fail("missing grim"),
             x11_display: Check::fail("not a native X11 session"),
         }
     }
@@ -2099,12 +2154,61 @@ pub(crate) mod tests {
     ) -> InputReport {
         InputReport {
             ydotool,
+            virtual_pointer: Check::fail("missing virtual pointer"),
             ydotoold,
             ydotool_socket,
             uinput,
             xdotool: Check::fail("missing xdotool"),
             wtype: Check::fail("missing wtype"),
             pixelflux: Check::fail("PIXELFLUX_CU is not set"),
+        }
+    }
+
+    #[test]
+    fn niri_capture_requires_grim_even_when_gnome_and_portal_are_available() {
+        let mut platform = platform_report();
+        platform.xdg_current_desktop = Some("NIRI:Wayland".into());
+        let mut portals = portal_report(Check::ok("portal input"));
+        portals.screenshot = Check::ok("portal screenshot");
+        assert!(screenshot_backends(&platform, &portals).is_empty());
+        platform.grim = Check::ok("grim");
+        assert_eq!(screenshot_backends(&platform, &portals), ["grim"]);
+    }
+
+    #[test]
+    fn niri_readiness_requires_pointer_keyboard_and_unicode_routes() {
+        let mut platform = platform_report();
+        platform.xdg_current_desktop = Some("niri".into());
+        platform.grim = Check::ok("grim");
+        let portals = portal_report(Check::ok("portal"));
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(true, true);
+        for mask in 0..8 {
+            let mut input = input_report(true);
+            input.virtual_pointer = if mask & 1 != 0 {
+                Check::ok("pointer")
+            } else {
+                Check::fail("missing pointer")
+            };
+            input.uinput = if mask & 2 != 0 {
+                Check::ok("keyboard")
+            } else {
+                Check::fail("denied uinput")
+            };
+            input.wtype = if mask & 4 != 0 {
+                Check::ok("unicode")
+            } else {
+                Check::fail("missing wtype")
+            };
+            let readiness =
+                readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+            assert_eq!(readiness.can_send_development_input, mask == 7);
+            if mask & 1 == 0 {
+                assert!(readiness
+                    .blockers
+                    .iter()
+                    .any(|s| s.contains("virtual-pointer")));
+            }
         }
     }
 
@@ -2226,6 +2330,7 @@ pub(crate) mod tests {
         platform.display = Some(":0".to_string());
         let input = InputReport {
             ydotool: Check::ok("ydotool"),
+            virtual_pointer: Check::fail("missing virtual pointer"),
             ydotoold: Check::ok("ydotoold"),
             ydotool_socket: Check::ok("connectable"),
             uinput: Check::fail("missing"),
@@ -2601,6 +2706,7 @@ pub(crate) mod tests {
         platform.display = None;
         let input = InputReport {
             ydotool: Check::ok("ydotool"),
+            virtual_pointer: Check::fail("missing virtual pointer"),
             ydotoold: Check::ok("ydotoold"),
             ydotool_socket: Check::ok("connectable"),
             uinput: Check::fail("missing"),

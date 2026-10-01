@@ -1,3 +1,5 @@
+> This local fork adds the **niri Computer Use Codex plugin**. See [NIRI.md](NIRI.md) for installation, added interfaces and acceptance results. Upstream documentation follows.
+
 <div align="center">
   <h1>computer-use-linux</h1>
   <p><strong>Native Linux desktop control for AI agents over MCP, Pi native tools, and CLI.</strong></p>
