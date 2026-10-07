@@ -23,6 +23,42 @@ struct Subcommand {
 
 const SUBCOMMANDS: &[Subcommand] = &[
     Subcommand {
+        name: "tools",
+        arguments: "[TOOL]",
+        required: 0,
+        allowed: 1,
+        summary: "List the tools, or print one tool's schema (no MCP framing).",
+        details: "Fork addition. Prints what `call` accepts.",
+        hidden: false,
+    },
+    Subcommand {
+        name: "call",
+        arguments: "TOOL [JSON_ARGUMENTS] [--no-daemon]",
+        required: 1,
+        allowed: 2,
+        summary: "Run one tool without MCP framing, through a per-user daemon.",
+        details: "Fork addition. Dispatches to the same handlers as the MCP server through a Unix-socket daemon so element indices and uinput devices persist. Images are written to files and reported by path.",
+        hidden: false,
+    },
+    Subcommand {
+        name: "daemon",
+        arguments: "",
+        required: 0,
+        allowed: 0,
+        summary: "Run the per-user daemon that `call` talks to.",
+        details: "Fork addition.",
+        hidden: false,
+    },
+    Subcommand {
+        name: "stop",
+        arguments: "",
+        required: 0,
+        allowed: 0,
+        summary: "Stop the per-user daemon.",
+        details: "Fork addition.",
+        hidden: false,
+    },
+    Subcommand {
         name: "mcp",
         arguments: "[--listen ADDR:PORT [--allowed-host NAME]...]",
         required: 0,
@@ -307,6 +343,14 @@ fn usage_error_text(error: &UsageError) -> String {
 
 pub(crate) async fn run_from_env() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // Fork addition: `call`/`tools`/`daemon`/`stop` parse their own arguments (`--no-daemon`, JSON).
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("call" | "tools" | "daemon" | "stop")
+    ) {
+        let code = server::run_native_cli(&arguments).await?;
+        std::process::exit(code);
+    }
     let invocation = match parse_invocation(&arguments) {
         Ok(invocation) => invocation,
         Err(error) => {
