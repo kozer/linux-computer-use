@@ -2,7 +2,7 @@ use crate::atspi_tree::{
     accessibility_chrome_context, focus_element as focus_accessible_element, focused_element_summary_in_app, list_accessible_apps,
     object_ref_application_pid, object_ref_owner_pid,
     perform_action as invoke_accessibility_action, perform_named_action, probe_focused_element,
-    select_element_text, set_element_value, snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode,
+    select_element_text, select_in_parent, set_element_value, snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode,
     AccessibleAppSummary, Bounds, EditableTextSetOutcome, FocusProbe, FocusedElementSummary,
     FocusedTextInsert, ValueSetInvocation,
 };
@@ -614,30 +614,8 @@ impl ComputerUseLinux {
         let (_guard, result) = run_cancellation_safe_input(guard, async move {
             let target = params.target.window_target();
             if !target.has_target() { return Err("paste requires an explicit window/app target".into()); }
-            this.focus_target_for_input(&target).await?;
-            let previous = clipboard_helper("snapshot", None).await?;
-            let offers = clipboard_offers(&params.target.text, params.html.as_deref());
-            let offered = clipboard_helper("offer", Some(offers.to_string().into_bytes())).await;
-            let action = match offered {
-                Ok(_) => {
-                    match this.focus_target_for_input(&target).await {
-                        Ok(_) => {
-                            let key = params.key.as_deref().unwrap_or("Ctrl+V");
-                            let result = this.send_niri_key(key).await;
-                            sleep(Duration::from_millis(params.restore_delay_ms.unwrap_or(500).clamp(100, 5000))).await;
-                            result
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            };
-            let restored = clipboard_helper("offer", Some(previous)).await;
-            match (action, restored) {
-                (Ok(()), Ok(_)) => Ok("Paste shortcut delivered; previous clipboard formats restored. Verify target contents with get_app_state.".to_string()),
-                (Err(error), Ok(_)) => Err(error),
-                (result, Err(error)) => Err(format!("{}; clipboard restoration failed: {error}", result.err().unwrap_or_else(|| "paste delivered".into()))),
-            }
+            let key = params.key.as_deref().unwrap_or("Ctrl+V");
+            this.clipboard_paste_text(&target, &params.target.text, params.html.as_deref(), key, params.restore_delay_ms).await
         }).await;
         Json(ActionOutput {
             ok: result.is_ok(),
@@ -1017,18 +995,23 @@ impl ComputerUseLinux {
                     })
                     .await;
                 }
-                let crop = if let Some(window) = window_context.as_ref() {
-                    Some(self.window_crop_rect_for_capture(window, &raw).await?)
+                let (crop, output_scope) = if let Some(window) = window_context.as_ref() {
+                    let mapping = self.window_crop_rect_for_capture(window, &raw).await?;
+                    (Some(mapping.capture_rect), mapping.output_name)
                 } else {
-                    None
+                    (None, None)
                 };
                 crate::screenshot_impl::run_image_task(move || {
-                    prepare_app_state_screenshot(
+                    let mut capture = prepare_app_state_screenshot(
                         raw,
                         crop,
                         screenshot_target_requested,
                         screenshot_options,
-                    )
+                    )?;
+                    if let Some(output) = &output_scope {
+                        capture.source.push_str(&output_scope_note(output));
+                    }
+                    Ok(capture)
                 })
                 .await
             }
@@ -1092,6 +1075,12 @@ impl ComputerUseLinux {
                 )
                 .await
                 {
+                    Ok(snapshot) if accessibility_target_requested && !snapshot.scoped => (
+                        Vec::new(),
+                        0,
+                        Some(UNMATCHED_TARGET_TREE_WITHHELD.to_string()),
+                        TreeRead::Failed,
+                    ),
                     Ok(snapshot) => {
                         unmatched_pid_note = unmatched_accessibility_pid_note(
                             target_pid,
@@ -1497,12 +1486,16 @@ impl ComputerUseLinux {
             None => None,
         };
 
+        let mut output_name = None;
         let crop_rect = match (crop_window, monitor_crop) {
-            (Some(window), _) => Some(
-                self.window_crop_rect_for_capture(window, &raw_capture)
+            (Some(window), _) => {
+                let mapping = self
+                    .window_crop_rect_for_capture(window, &raw_capture)
                     .await
-                    .context("targeted screenshot crop failed")?,
-            ),
+                    .context("targeted screenshot crop failed")?;
+                output_name = mapping.output_name;
+                Some(mapping.capture_rect)
+            }
             (None, Some((_, _, rect))) => Some(rect),
             (None, None) => None,
         };
@@ -1550,9 +1543,13 @@ impl ComputerUseLinux {
             "format": capture.format,
             "quality": capture.quality,
             "source": capture.source,
-            "cropped_to_window": cropped,
+            "cropped_to_window": cropped && output_name.is_none(),
             "window_title": window_label,
         });
+        if let Some(output) = &output_name {
+            caption["cropped_to_output"] = serde_json::json!(output);
+            caption["output_note"] = serde_json::json!(output_scope_note(output).trim());
+        }
         if let Some((index, count, (x, y, _, _))) = monitor_crop {
             caption["monitor"] = serde_json::json!(index);
             caption["monitor_count"] = serde_json::json!(count);
@@ -2043,6 +2040,7 @@ impl ComputerUseLinux {
                 });
             }
         }
+        let element_targeted = params.x.zip(params.y).is_none();
         let target = match self.resolve_click_target(&params) {
             Ok(target) => target,
             Err(message) => {
@@ -2105,6 +2103,53 @@ impl ComputerUseLinux {
                 }),
             };
         }
+        let target = match target {
+            ClickTarget::SelectInParent {
+                object_ref,
+                fallback,
+            } => match select_in_parent(&object_ref).await {
+                Ok(()) => {
+                    return Json(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message: "Selected the element through its parent's AT-SPI Selection without pointer-coordinate conversion.".to_string(),
+                        received,
+                    });
+                }
+                Err(error) => match fallback {
+                    Some((x, y)) if !element_bounds_are_window_relative() => {
+                        ClickTarget::Coordinates(x, y)
+                    }
+                    _ => {
+                        return Json(ActionOutput {
+                            ok: false,
+                            implemented: true,
+                            action: "click".to_string(),
+                            message: format!(
+                                "AT-SPI selection failed: {error:#}. {}",
+                                WINDOW_RELATIVE_BOUNDS_HINT
+                            ),
+                            received,
+                        });
+                    }
+                },
+            },
+            ClickTarget::Coordinates(..)
+                if element_targeted && element_bounds_are_window_relative() =>
+            {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: format!(
+                        "The element has no click-equivalent AT-SPI action. {WINDOW_RELATIVE_BOUNDS_HINT}"
+                    ),
+                    received,
+                });
+            }
+            other => other,
+        };
         let element_bounds = match &target {
             ClickTarget::ElementBounds { node, .. } | ClickTarget::ElementPoint { node, .. } => {
                 node.bounds.clone()
@@ -2114,6 +2159,9 @@ impl ComputerUseLinux {
         let element_click = element_bounds.is_some();
         let global_point = matches!(&target, ClickTarget::ElementPoint { .. });
         let (x, y, kwin_click) = match target {
+            ClickTarget::SelectInParent { .. } => {
+                unreachable!("select-in-parent targets are handled before coordinate resolution")
+            }
             ClickTarget::Coordinates(x, y) => (x, y, None),
             ClickTarget::ElementBounds { node, center }
             | ClickTarget::ElementPoint {
@@ -2880,6 +2928,18 @@ impl ComputerUseLinux {
                     received,
                 });
             }
+        }
+        if params.x.zip(params.y).is_none()
+            && params.element_index.is_some()
+            && element_bounds_are_window_relative()
+        {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message: WINDOW_RELATIVE_BOUNDS_HINT.to_string(),
+                received,
+            });
         }
         let target_point =
             match self.resolve_optional_target_point(params.x, params.y, params.element_index) {
@@ -4052,6 +4112,27 @@ impl ComputerUseLinux {
 
     async fn dispatch_type_text(&self, params: TypeTextParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        if wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text) {
+            let guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+            let this = self.clone();
+            let text = params.text.clone();
+            let target = params.window_target();
+            let (_guard, result) = run_cancellation_safe_input(guard, async move {
+                let focus = this.focus_target_for_input(&target).await?;
+                let key = paste_chord_name(kde_clipboard_paste_shortcut(&target, focus.as_ref()).await);
+                this.clipboard_paste_text(&target, &text, None, key, None)
+                    .await
+                    .map(|message| format!("Non-ASCII text sent through the clipboard ({key}). {message}"))
+            })
+            .await;
+            return Json(ActionOutput {
+                ok: result.is_ok(),
+                implemented: true,
+                action: "type_text".to_string(),
+                message: result.unwrap_or_else(|e| e),
+                received,
+            });
+        }
         // Reject before focus changes or any indicator can display the text.
         let wtype_mode = self.wtype_text_mode();
         if let Err(message) = preflight_type_text(&params.text, wtype_mode) {
@@ -4843,6 +4924,10 @@ struct ListAppsOutput {
 struct ListWindowsOutput {
     backend: String,
     windows: Vec<WindowInfo>,
+    /// niri layer-shell surfaces (launchers, bars, notifications). They are
+    /// not windows: target them with output screenshots and plain key input.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    layer_surfaces: Vec<crate::windowing::backends::niri::LayerSurface>,
     error: Option<String>,
     permissions_hint: Option<String>,
     note: String,
@@ -6732,6 +6817,39 @@ impl ComputerUseLinux {
         .await
         .map_err(|e| e.to_string())?
     }
+    /// Offers `text` on the clipboard, sends the paste chord to the focused
+    /// target, then restores every previous clipboard format.
+    async fn clipboard_paste_text(
+        &self,
+        target: &WindowTarget,
+        text: &str,
+        html: Option<&str>,
+        key: &str,
+        restore_delay_ms: Option<u64>,
+    ) -> std::result::Result<String, String> {
+        self.focus_target_for_input(target).await?;
+        let previous = clipboard_helper("snapshot", None).await?;
+        let offers = clipboard_offers(text, html);
+        let offered = clipboard_helper("offer", Some(offers.to_string().into_bytes())).await;
+        let action = match offered {
+            Ok(_) => match self.focus_target_for_input(target).await {
+                Ok(_) => {
+                    let result = self.send_niri_key(key).await;
+                    sleep(Duration::from_millis(restore_delay_ms.unwrap_or(500).clamp(100, 5000))).await;
+                    result
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let restored = clipboard_helper("offer", Some(previous)).await;
+        match (action, restored) {
+            (Ok(()), Ok(_)) => Ok("Paste shortcut delivered; previous clipboard formats restored. Verify target contents with get_app_state.".to_string()),
+            (Err(error), Ok(_)) => Err(error),
+            (result, Err(error)) => Err(format!("{}; clipboard restoration failed: {error}", result.err().unwrap_or_else(|| "paste delivered".into()))),
+        }
+    }
+
     async fn send_niri_key(&self, key: &str) -> std::result::Result<(), String> {
         if !env_contains("XDG_CURRENT_DESKTOP", "niri") {
             let args = wtype_key_args(key).ok_or_else(|| "unsupported key chord".to_string())?;
@@ -7273,7 +7391,8 @@ impl ComputerUseLinux {
                         let (x, y, width, height) = self
                             .window_crop_rect_for_capture(window, &raw_capture)
                             .await
-                            .context("targeted post-action screenshot crop failed")?;
+                            .context("targeted post-action screenshot crop failed")?
+                            .capture_rect;
                         let (raw_capture, bytes, width, height) =
                             crate::screenshot_impl::run_image_task(move || {
                                 let (bytes, width, height) =
@@ -7785,21 +7904,9 @@ impl ComputerUseLinux {
         &self,
         window: &WindowInfo,
         raw: &RawScreenshotCapture,
-    ) -> Result<(i32, i32, u32, u32)> {
-        self.window_crop_rect_for_dimensions(window, raw.width, raw.height)
+    ) -> Result<WindowCoordinateMap> {
+        self.window_coordinate_map_for_dimensions(window, raw.width, raw.height)
             .await
-    }
-
-    async fn window_crop_rect_for_dimensions(
-        &self,
-        window: &WindowInfo,
-        capture_width: u32,
-        capture_height: u32,
-    ) -> Result<(i32, i32, u32, u32)> {
-        Ok(self
-            .window_coordinate_map_for_dimensions(window, capture_width, capture_height)
-            .await?
-            .capture_rect)
     }
 
     async fn window_coordinate_map_for_dimensions(
@@ -7825,6 +7932,15 @@ impl ComputerUseLinux {
         } else {
             window
         };
+        if let Some(output) = niri_output_for_unplaced_window(window).await? {
+            let full_capture_rect = output.rect;
+            return Ok(WindowCoordinateMap {
+                capture_rect: clip_capture_rect(full_capture_rect, capture_width, capture_height)?,
+                full_capture_rect,
+                portal_rect: None,
+                output_name: Some(output.name),
+            });
+        }
         let bounds = window.bounds.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "targeted screenshot requires window bounds; refusing to return the full desktop"
@@ -7890,6 +8006,7 @@ impl ComputerUseLinux {
             capture_rect: clip_capture_rect(full_capture_rect, capture_width, capture_height)?,
             full_capture_rect,
             portal_rect,
+            output_name: None,
         })
     }
 
@@ -7923,13 +8040,21 @@ impl ComputerUseLinux {
                 | KWIN_BACKEND
                 | crate::windowing::backends::cosmic::COSMIC_WAYLAND_BACKEND
         ) {
-            let full_capture_rect = window
-                .bounds
-                .as_ref()
-                .and_then(window_crop_rect)
-                .ok_or_else(|| {
-                    "Window-relative coordinates require usable target-window bounds.".to_string()
-                })?;
+            let output = niri_output_for_unplaced_window(window)
+                .await
+                .map_err(|error| format!("Could not map target-window coordinates: {error:#}"))?;
+            let output_name = output.as_ref().map(|output| output.name.clone());
+            let full_capture_rect = match output {
+                Some(output) => output.rect,
+                None => window
+                    .bounds
+                    .as_ref()
+                    .and_then(window_crop_rect)
+                    .ok_or_else(|| {
+                        "Window-relative coordinates require usable target-window bounds."
+                            .to_string()
+                    })?,
+            };
             let capture_rect = self
                 .desktop_size
                 .lock()
@@ -7946,6 +8071,7 @@ impl ComputerUseLinux {
                 capture_rect,
                 full_capture_rect,
                 portal_rect: None,
+                output_name,
             });
         }
         let (_, _, width, height) = self.capture_space_rect().await.ok_or_else(|| {
@@ -9419,6 +9545,13 @@ impl ComputerUseLinux {
             }
         }
 
+        if is_selectable_item_role(&node.role) {
+            return Ok(ClickTarget::SelectInParent {
+                object_ref: node.object_ref.clone(),
+                fallback: node.bounds.as_ref().and_then(bounds_center),
+            });
+        }
+
         if let Some(center) = node.bounds.as_ref().and_then(bounds_center) {
             return Ok(ClickTarget::ElementBounds {
                 node: Box::new(node),
@@ -10207,6 +10340,12 @@ fn pixelflux_action_output(
 #[derive(Debug)]
 enum ClickTarget {
     Coordinates(i32, i32),
+    /// Select a tab or item through its parent's AT-SPI Selection; `fallback`
+    /// is the element's bounds center, used only if selection fails.
+    SelectInParent {
+        object_ref: String,
+        fallback: Option<(i32, i32)>,
+    },
     ElementBounds {
         node: Box<AccessibilityNode>,
         center: (i32, i32),
@@ -10479,15 +10618,16 @@ fn unscoped_accessibility_tree_warning(
     tree_ok: bool,
     target_requested: bool,
 ) -> Option<&'static str> {
-    if !tree_ok || tree_scoped {
+    // A targeted request that matched nothing has its tree withheld instead.
+    if !tree_ok || tree_scoped || target_requested {
         return None;
     }
-    Some(if target_requested {
-        "WARNING: the requested target matched no AT-SPI application root, so the accessibility tree covers the whole desktop and can flood context. The target app may expose no accessibility tree (Electron apps need --force-renderer-accessibility); check list_apps for its AT-SPI name and pass that as app_name_or_bundle_identifier, or lower max_nodes to bound the cost."
-    } else {
-        "WARNING: no app target scoped the accessibility tree, so it covers the whole desktop and can flood context. Pass app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title) to limit it."
-    })
+    Some("WARNING: no app target scoped the accessibility tree, so it covers the whole desktop and can flood context. Pass app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title) to limit it.")
 }
+
+/// A caller that names a window or app must never receive other apps' trees:
+/// they can hold unrelated, sensitive content (password managers, chats).
+const UNMATCHED_TARGET_TREE_WITHHELD: &str = "the requested target matched no AT-SPI application root (the window may be closed, or the app exposes no accessibility tree; Electron apps need --force-renderer-accessibility), so the whole-desktop tree was withheld. Check list_windows, or list_apps for the app's AT-SPI name and pass that as app_name_or_bundle_identifier.";
 
 /// Note appended when raw traversal hit max_nodes; the tree is incomplete.
 fn truncated_accessibility_tree_note(truncated: bool) -> Option<&'static str> {
@@ -10941,6 +11081,24 @@ fn push_candidate(candidates: &mut Vec<String>, value: Option<&str>) {
 
 fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+const WINDOW_RELATIVE_BOUNDS_HINT: &str = "On niri, AT-SPI element bounds are relative to the app window and niri reports no position for tiled windows, so an element cannot be converted to a pointer position. Take a screenshot of the window and pass x/y with relative=true from it, or use perform_action, or focus_element followed by press_key.";
+
+/// Wayland clients report AT-SPI extents relative to their own surface, and
+/// niri does not report where a tiled window is. Element bounds therefore are
+/// not pointer coordinates there.
+fn element_bounds_are_window_relative() -> bool {
+    env_contains("XDG_CURRENT_DESKTOP", "niri")
+}
+
+/// Roles that are usually activated by selection in their container rather
+/// than by an AT-SPI action.
+fn is_selectable_item_role(role: &str) -> bool {
+    matches!(
+        role,
+        "page tab" | "list item" | "tree item" | "table cell" | "table row"
+    )
 }
 
 fn env_contains(key: &str, needle: &str) -> bool {
@@ -12485,11 +12643,14 @@ fn ensure_readonly_screenshot_target_is_visible(window: &WindowInfo) -> Result<(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WindowCoordinateMap {
     capture_rect: (i32, i32, u32, u32),
     full_capture_rect: (i32, i32, u32, u32),
     portal_rect: Option<(i32, i32, u32, u32)>,
+    /// Set when the rect is the whole output showing the window, because the
+    /// compositor reports no window position (niri tiled windows).
+    output_name: Option<String>,
 }
 
 impl WindowCoordinateMap {
@@ -12749,6 +12910,26 @@ fn clip_capture_rect(
         u32::try_from(bottom - top)
             .map_err(|_| anyhow::anyhow!("capture crop height is invalid"))?,
     ))
+}
+
+/// The output showing a niri window that has a size but no reported position.
+/// niri reports positions only for floating windows, so a tiled window's crop
+/// falls back to its whole output instead of failing or guessing an origin.
+async fn niri_output_for_unplaced_window(
+    window: &WindowInfo,
+) -> Result<Option<crate::windowing::backends::niri::VisibleOutput>> {
+    if window.backend != crate::windowing::backends::niri::NIRI_BACKEND
+        || window.bounds.as_ref().and_then(window_crop_rect).is_some()
+    {
+        return Ok(None);
+    }
+    crate::windowing::backends::niri::visible_output(window.window_id).await
+}
+
+fn output_scope_note(output: &str) -> String {
+    format!(
+        " (whole output {output}: niri reports no position for tiled windows; relative coordinates are output-relative)"
+    )
 }
 
 /// Convert a window's bounds into a crop rectangle, if it has a usable origin
@@ -13359,9 +13540,15 @@ async fn window_list_output() -> ListWindowsOutput {
         Ok(windows) => {
             let backend = window_backend(windows.iter());
             let note = registry::list_note(&backend);
+            let layer_surfaces = if backend == crate::windowing::backends::niri::NIRI_BACKEND {
+                crate::windowing::backends::niri::list_layers().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             ListWindowsOutput {
                 backend,
                 windows,
+                layer_surfaces,
                 error: None,
                 permissions_hint: None,
                 note: note.to_string(),
@@ -13372,6 +13559,7 @@ async fn window_list_output() -> ListWindowsOutput {
             ListWindowsOutput {
                 backend: UNAVAILABLE_BACKEND.to_string(),
                 windows: Vec::new(),
+                layer_surfaces: Vec::new(),
                 permissions_hint: window_permission_hint(&error),
                 error: Some(error),
                 note: "Window listing failed, so targeted keyboard input cannot safely focus or verify a target window."
@@ -14198,6 +14386,22 @@ where
     Ok((result, None))
 }
 
+/// wtype swaps in its own keymap for characters outside the active layout,
+/// and Chromium-based browsers read those keycodes as shortcuts (observed:
+/// Greek text opened Brave's help page and new tabs). Such text goes through
+/// the clipboard instead.
+fn wtype_needs_clipboard(uses_wtype: bool, text: &str) -> bool {
+    uses_wtype && !text.is_ascii()
+}
+
+fn paste_chord_name(shortcut: KdeClipboardPasteShortcut) -> &'static str {
+    match shortcut {
+        KdeClipboardPasteShortcut::Standard => "Ctrl+V",
+        KdeClipboardPasteShortcut::CtrlShiftV => "Ctrl+Shift+V",
+        KdeClipboardPasteShortcut::ShiftInsert => "Shift+Insert",
+    }
+}
+
 async fn run_wtype_type_text_or_fallback<F, Fut>(
     program: &Path,
     text: &str,
@@ -14692,6 +14896,7 @@ fn xdotool_keysym_name(key: &str) -> Option<String> {
         "tab" => "Tab",
         "backspace" => "BackSpace",
         "delete" | "del" => "Delete",
+        "insert" | "ins" => "Insert",
         "space" => "space",
         "home" => "Home",
         "end" => "End",
@@ -14839,6 +15044,7 @@ fn named_keysym(key: &str) -> Option<i32> {
         "tab" => xkey::Tab,
         "backspace" => xkey::BackSpace,
         "delete" | "del" => xkey::Delete,
+        "insert" | "ins" => xkey::Insert,
         "space" => xkey::space,
         "home" => xkey::Home,
         "end" => xkey::End,
@@ -14906,6 +15112,7 @@ fn keycode(key: &str) -> Option<u16> {
         "tab" => Some(15),
         "backspace" => Some(14),
         "delete" | "del" => Some(111),
+        "insert" | "ins" => Some(110),
         "space" => Some(57),
         "home" => Some(102),
         "end" => Some(107),
@@ -16085,6 +16292,20 @@ case "$*" in *"-- 5001 1301"*) echo "xdotool: test failure" >&2; exit 1 ;; esac
     }
 
     #[test]
+    fn wtype_routes_non_ascii_text_through_the_clipboard() {
+        assert!(wtype_needs_clipboard(true, "Όχι, δεν τον χάκαρα! 😄"));
+        assert!(!wtype_needs_clipboard(true, "hi from claude"));
+        assert!(!wtype_needs_clipboard(false, "Όχι"));
+        for shortcut in [
+            KdeClipboardPasteShortcut::Standard,
+            KdeClipboardPasteShortcut::CtrlShiftV,
+            KdeClipboardPasteShortcut::ShiftInsert,
+        ] {
+            assert!(key_chord(paste_chord_name(shortcut)).is_some());
+        }
+    }
+
+    #[test]
     fn completion_tool_is_explicitly_opt_in_and_has_side_effect_annotations() {
         let server = ComputerUseLinux::default();
         assert!(!server
@@ -16958,6 +17179,7 @@ esac
             capture_rect: (8, 48, 1810, 1526),
             full_capture_rect: (8, 48, 1810, 1526),
             portal_rect: Some((6, 36, 1357, 1144)),
+            output_name: None,
         };
         assert_eq!(scaled.portal_point(913, 811), Some((684, 608)));
 
@@ -16965,6 +17187,7 @@ esac
             capture_rect: (0, 0, 50, 60),
             full_capture_rect: (-50, -40, 100, 100),
             portal_rect: Some((-50, -40, 100, 100)),
+            output_name: None,
         };
         assert_eq!(clipped.portal_point(0, 0), Some((0, 0)));
     }
@@ -16984,6 +17207,7 @@ esac
             capture_rect: full_capture_rect,
             full_capture_rect,
             portal_rect: Some(logical_rect),
+            output_name: None,
         };
 
         assert_eq!(mapping.capture_rect, (2000, 200, 1600, 1200));
@@ -17005,6 +17229,7 @@ esac
             capture_rect: full_capture_rect,
             full_capture_rect,
             portal_rect: Some(logical_rect),
+            output_name: None,
         };
 
         assert_eq!(mapping.capture_rect, (2000, 200, 1600, 1200));
@@ -18473,6 +18698,66 @@ esac
             .unwrap_err();
 
         assert!(error.contains("No clickable bounds cached for element_index 7"));
+    }
+
+    #[test]
+    fn click_selects_actionless_tab_through_its_parent() {
+        let backend = ComputerUseLinux::default();
+        let mut tab = node(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 40,
+                height: 20,
+            }),
+        );
+        tab.role = "page tab".to_string();
+        backend.cache_nodes(&[tab]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                ..Default::default()
+            })
+            .unwrap();
+
+        match target {
+            ClickTarget::SelectInParent {
+                object_ref,
+                fallback,
+            } => {
+                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+                assert_eq!(fallback, Some((30, 30)));
+            }
+            other => panic!("expected selection through the parent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_click_on_tab_keeps_pointer_target() {
+        let backend = ComputerUseLinux::default();
+        let mut tab = node(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 40,
+                height: 20,
+            }),
+        );
+        tab.role = "page tab".to_string();
+        backend.cache_nodes(&[tab]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                button: Some("right".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(matches!(target, ClickTarget::Coordinates(30, 30)));
     }
 
     #[test]
@@ -22129,7 +22414,10 @@ printf '0x00000007 0 %s 0 0 100 100 first.First host Target 7\n0x00000008 0 %s 0
 
 #[cfg(test)]
 mod accessibility_tree_note_tests {
-    use super::{truncated_accessibility_tree_note, unscoped_accessibility_tree_warning};
+    use super::{
+        truncated_accessibility_tree_note, unscoped_accessibility_tree_warning,
+        UNMATCHED_TARGET_TREE_WITHHELD,
+    };
 
     #[test]
     fn unscoped_warning_only_when_tree_succeeded_without_a_scope() {
@@ -22146,16 +22434,14 @@ mod accessibility_tree_note_tests {
         }
     }
 
-    /// A caller that already passed a target must not be told to pass a target;
-    /// that advice would replay the same desktop-wide snapshot.
+    /// A targeted request that matched no root gets no tree, so no warning;
+    /// the withheld-tree error points at accessibility support instead.
     #[test]
-    fn unscoped_warning_with_a_target_points_at_accessibility_support() {
-        let warning = unscoped_accessibility_tree_warning(false, true, true).unwrap();
-        assert!(warning.starts_with("WARNING:"));
-        assert!(warning.contains("matched no AT-SPI application root"));
-        assert!(warning.contains("force-renderer-accessibility"));
-        assert!(warning.contains("list_apps"));
-        assert!(!warning.contains("Pass app_name_or_bundle_identifier or a window target"));
+    fn unmatched_target_withholds_the_tree_instead_of_warning() {
+        assert!(unscoped_accessibility_tree_warning(false, true, true).is_none());
+        assert!(UNMATCHED_TARGET_TREE_WITHHELD.contains("withheld"));
+        assert!(UNMATCHED_TARGET_TREE_WITHHELD.contains("force-renderer-accessibility"));
+        assert!(UNMATCHED_TARGET_TREE_WITHHELD.contains("list_apps"));
     }
 
     #[test]
