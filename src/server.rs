@@ -4133,8 +4133,8 @@ impl ComputerUseLinux {
             let Json(output) = self.type_text_inner(params, &mut expected).await;
             return Json(with_post_input_focus_check(output, expected).await);
         }
-        // Per-key typing: send in chunks and re-read focus after each, so a
-        // window switch mid-text aborts the rest instead of typing into it.
+        // Per-key typing: send one character at a time and re-read focus after
+        // each, so a window switch mid-text aborts the rest instead of typing into it.
         let chunks = split_text_chunks(&params.text, TYPE_TEXT_FOCUS_CHUNK_CHARS);
         let total_chars = params.text.chars().count();
         let mut sent_chars = 0;
@@ -13617,9 +13617,9 @@ fn portal_focus_target(target: &WindowTarget, window: &WindowInfo) -> WindowTarg
 }
 
 /// Characters sent per round when typing under an exact-focus target. Focus is
-/// re-read between rounds so a user switching windows mid-text stops the input
-/// instead of letting the remainder land in their window.
-const TYPE_TEXT_FOCUS_CHUNK_CHARS: usize = 32;
+/// re-read before and after every round, so a user switching windows mid-text
+/// receives at most one stray character instead of the rest of the text.
+const TYPE_TEXT_FOCUS_CHUNK_CHARS: usize = 1;
 
 /// The window id input must still be going to, or None when the target does not
 /// demand exact focus (or focus was not verified), so no post-check applies.
