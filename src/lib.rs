@@ -21,6 +21,7 @@ pub mod indicator;
 mod keyboard_keymap;
 mod pixelflux;
 mod pointer_path;
+mod input_hold;
 mod keyboard;
 mod niri_pointer;
 mod remote_desktop;
