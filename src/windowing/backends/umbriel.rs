@@ -173,7 +173,7 @@ pub async fn activate_window(window_id: u64) -> Result<()> {
             .find(|window| short_id(&window.id) == Some(window_id))
             .map(|window| window.id)
             .ok_or_else(|| anyhow!("umbriel lists no window {window_id:016x}"))?;
-        umbriel_json(&["msg", &format!("window-focus:{full}")]).map(|_| ())
+        umbriel_json(&["msg", "window-focus", &full]).map(|_| ())
     })
     .await
     .context("umbriel focus task panicked")?
