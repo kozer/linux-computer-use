@@ -394,7 +394,7 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
 
 /// Desktops whose screenshots must come from grim (wlr-screencopy) to keep
 /// image pixels aligned with pointer coordinates.
-fn desktop_requires_grim(xdg_current_desktop: &str) -> bool {
+pub(crate) fn desktop_requires_grim(xdg_current_desktop: &str) -> bool {
     xdg_current_desktop
         .split(':')
         .any(|d| d.eq_ignore_ascii_case("niri") || d.eq_ignore_ascii_case("umbriel"))

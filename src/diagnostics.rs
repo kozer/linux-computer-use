@@ -1050,16 +1050,19 @@ fn screenshot_backends(
     portals: &PortalReport,
     input: &InputReport,
 ) -> Vec<String> {
-    if is_niri_platform(platform) {
-        return if platform.grim.ok {
-            vec!["grim".into()]
-        } else {
-            Vec::new()
-        };
-    }
     let mut backends = Vec::new();
     if input.pixelflux.ok {
         backends.push("pixelflux".to_string());
+    }
+    if platform
+        .xdg_current_desktop
+        .as_deref()
+        .is_some_and(crate::screenshot::desktop_requires_grim)
+    {
+        if platform.grim.ok {
+            backends.push("grim".to_string());
+        }
+        return backends;
     }
     if platform.dms_screenshot.ok {
         backends.push("dms".to_string());
@@ -2175,6 +2178,33 @@ pub(crate) mod tests {
         assert_eq!(
             screenshot_backends(&platform, &portals, &input_report(false)),
             ["grim"]
+        );
+    }
+
+    #[test]
+    fn umbriel_capture_lists_grim_like_niri() {
+        let mut platform = platform_report();
+        platform.xdg_current_desktop = Some("umbriel".into());
+        let portals = portal_report(Check::ok("portal input"));
+        assert!(screenshot_backends(&platform, &portals, &input_report(false)).is_empty());
+        platform.grim = Check::ok("grim");
+        assert_eq!(
+            screenshot_backends(&platform, &portals, &input_report(false)),
+            ["grim"]
+        );
+    }
+
+    #[test]
+    fn configured_pixelflux_precedes_grim_route() {
+        let mut platform = platform_report();
+        platform.xdg_current_desktop = Some("niri".into());
+        platform.grim = Check::ok("grim");
+        let portals = portal_report(Check::ok("portal input"));
+        let mut input = input_report(false);
+        input.pixelflux = Check::ok("pixelflux");
+        assert_eq!(
+            screenshot_backends(&platform, &portals, &input),
+            ["pixelflux", "grim"]
         );
     }
 
