@@ -392,6 +392,14 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     Ok(capture)
 }
 
+/// Desktops whose screenshots must come from grim (wlr-screencopy) to keep
+/// image pixels aligned with pointer coordinates.
+fn desktop_requires_grim(xdg_current_desktop: &str) -> bool {
+    xdg_current_desktop
+        .split(':')
+        .any(|d| d.eq_ignore_ascii_case("niri") || d.eq_ignore_ascii_case("umbriel"))
+}
+
 async fn capture_screenshot_raw_unrecorded() -> Result<RawScreenshotCapture> {
     hydrate_session_bus_env();
 
@@ -401,23 +409,25 @@ async fn capture_screenshot_raw_unrecorded() -> Result<RawScreenshotCapture> {
     if let Some(forced) = forced_backend()? {
         return forced.capture().await;
     }
-    if std::env::var("XDG_CURRENT_DESKTOP")
-        .is_ok_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("niri")))
-    {
-        // niri 26.04's GNOME Screenshot shim allocates integer-scaled pixels
-        // while its render elements retain fractional scale. That image cannot
-        // be used as normalized pointer space. Capture actual output pixels.
-        return capture_with_grim().await.context(
-            "niri requires grim/wlr-screencopy for accurate screenshot coordinates; install grim",
-        );
-    }
-
+    // An explicit pixelflux config targets a remote Selkies desktop, so it wins
+    // over local desktop detection.
     if let Some(config) = crate::pixelflux::PixelfluxConfig::from_env() {
         match capture_with_pixelflux(&config).await {
             Ok(capture) => return Ok(capture),
             Err(error) if crate::pixelflux::is_unreachable(&error) => {}
             Err(error) => return Err(error),
         }
+    }
+
+    if std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop_requires_grim(&desktop)) {
+        // niri 26.04's GNOME Screenshot shim allocates integer-scaled pixels
+        // while its render elements retain fractional scale. That image cannot
+        // be used as normalized pointer space. Capture actual output pixels.
+        // Umbriel (niri-based) takes the same route: grim stitches every
+        // output, and `dms` is not always installed beside it.
+        return capture_with_grim().await.context(
+            "niri/umbriel require grim/wlr-screencopy for accurate screenshot coordinates; install grim",
+        );
     }
 
     // xdg-desktop-portal-umbriel answers a non-interactive screenshot with one
@@ -1232,6 +1242,15 @@ fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grim_route_covers_niri_and_umbriel_sessions() {
+        assert!(desktop_requires_grim("niri"));
+        assert!(desktop_requires_grim("umbriel"));
+        assert!(desktop_requires_grim("GNOME:Umbriel"));
+        assert!(!desktop_requires_grim("GNOME"));
+        assert!(!desktop_requires_grim(""));
+    }
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
