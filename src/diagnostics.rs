@@ -242,12 +242,11 @@ impl ReadinessReport {
         self.warnings.retain(|warning| {
             warning != SCREENSHOT_UNVERIFIED && warning != SCREENSHOT_MISSING_GNOME_FALLBACK
         });
-        self.blockers
-            .retain(|blocker| {
-                blocker != SCREENSHOT_UNAVAILABLE
-                    && blocker != SCREENSHOT_UNAVAILABLE_NIRI
-                    && blocker != SCREENSHOT_FAILED
-            });
+        self.blockers.retain(|blocker| {
+            blocker != SCREENSHOT_UNAVAILABLE
+                && blocker != SCREENSHOT_UNAVAILABLE_NIRI
+                && blocker != SCREENSHOT_FAILED
+        });
         if !succeeded {
             self.blockers.push(SCREENSHOT_FAILED.to_string());
         }
@@ -374,7 +373,8 @@ fn capability_map_with_portal_keyboard(
         }
     }
     // Absolute uinput pointer: accurate, non-blocking of coordinates; preferred.
-    if input.uinput.ok && platform_is_wayland(platform)
+    if input.uinput.ok
+        && platform_is_wayland(platform)
         && !is_cosmic_wayland_platform(platform)
         && !is_niri_platform(platform)
     {
@@ -2170,9 +2170,12 @@ pub(crate) mod tests {
         platform.xdg_current_desktop = Some("NIRI:Wayland".into());
         let mut portals = portal_report(Check::ok("portal input"));
         portals.screenshot = Check::ok("portal screenshot");
-        assert!(screenshot_backends(&platform, &portals).is_empty());
+        assert!(screenshot_backends(&platform, &portals, &input_report(false)).is_empty());
         platform.grim = Check::ok("grim");
-        assert_eq!(screenshot_backends(&platform, &portals), ["grim"]);
+        assert_eq!(
+            screenshot_backends(&platform, &portals, &input_report(false)),
+            ["grim"]
+        );
     }
 
     #[test]

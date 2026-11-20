@@ -729,7 +729,8 @@ fn visible_output_from(
         .output
         .ok_or_else(|| format!("workspace {workspace_id} has no output"))?;
     let unmapped = || format!("output {name} has no capture geometry (mixed scales?)");
-    let capture = NiriCaptureLayout::from_outputs(&parse_output_geometries(outputs)).ok_or_else(unmapped)?;
+    let capture =
+        NiriCaptureLayout::from_outputs(&parse_output_geometries(outputs)).ok_or_else(unmapped)?;
     let logical = BTreeMap::<String, Output>::deserialize(outputs)
         .ok()
         .and_then(|mut outputs| outputs.remove(&name))

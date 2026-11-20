@@ -7,9 +7,9 @@ mod background_input;
 mod cli;
 mod command_runner;
 mod cosmic_helper;
+mod desktop_apps;
 mod devtools;
 mod diagnostics_cache;
-mod desktop_apps;
 #[path = "diagnostics.rs"]
 mod diagnostics_impl;
 mod ei_input;
@@ -18,12 +18,12 @@ mod http_listen;
 mod hyprland_input;
 mod identity;
 pub mod indicator;
-mod keyboard_keymap;
-mod pixelflux;
-mod pointer_path;
 mod input_hold;
 mod keyboard;
+mod keyboard_keymap;
 mod niri_pointer;
+mod pixelflux;
+mod pointer_path;
 mod remote_desktop;
 mod screenshot_file;
 #[path = "screenshot.rs"]
@@ -46,9 +46,10 @@ pub mod atspi_tree {
         accessibility_chrome_context, element_role_states_actions, focus_element,
         focused_element_summary_in_app, insert_text_at_focus, insert_text_into_element,
         is_window_role, list_accessible_apps, object_ref_application_pid, object_ref_owner_pid,
-        perform_action, perform_named_action, probe_focused_element, select_element_text, select_in_parent, set_element_value,
-        snapshot_accessibility_tree, snapshot_limits, AccessibleAppSummary, EditableTextSetOutcome,
-        FocusProbe, FocusedElementSummary, FocusedTextInsert, ValueSetInvocation, UNKNOWN_ROLE,
+        perform_action, perform_named_action, probe_focused_element, select_element_text,
+        select_in_parent, set_element_value, snapshot_accessibility_tree, snapshot_limits,
+        AccessibleAppSummary, EditableTextSetOutcome, FocusProbe, FocusedElementSummary,
+        FocusedTextInsert, ValueSetInvocation, UNKNOWN_ROLE,
     };
     pub use crate::atspi_tree_impl::{
         snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibilityText,

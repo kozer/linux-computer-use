@@ -1,10 +1,11 @@
 use crate::atspi_tree::{
-    accessibility_chrome_context, focus_element as focus_accessible_element, focused_element_summary_in_app, list_accessible_apps,
-    object_ref_application_pid, object_ref_owner_pid,
-    perform_action as invoke_accessibility_action, perform_named_action, probe_focused_element,
-    select_element_text, select_in_parent, set_element_value, snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode,
-    AccessibleAppSummary, Bounds, EditableTextSetOutcome, FocusProbe, FocusedElementSummary,
-    FocusedTextInsert, ValueSetInvocation,
+    accessibility_chrome_context, focus_element as focus_accessible_element,
+    focused_element_summary_in_app, list_accessible_apps, object_ref_application_pid,
+    object_ref_owner_pid, perform_action as invoke_accessibility_action, perform_named_action,
+    probe_focused_element, select_element_text, select_in_parent, set_element_value,
+    snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
+    Bounds, EditableTextSetOutcome, FocusProbe, FocusedElementSummary, FocusedTextInsert,
+    ValueSetInvocation,
 };
 use crate::diagnostics::{
     doctor_report, setup_accessibility_report, DoctorReport, ReadinessReport, SetupReport,
@@ -1919,31 +1920,33 @@ impl ComputerUseLinux {
             }
         }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        if let Err(message) = take_input_hold(hold).await {
-            return (
-                Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message,
-                    received,
-                }),
-                PostActionScope::default(),
-                None,
-            );
-        }
         // Before the window is raised: a refused call changes nothing.
         match self.check_element_snapshot(
             "click",
             params.snapshot_id.as_deref(),
             click_resolves_cached_element(&params),
         ) {
-            Ok(scope) => (
-                self.dispatch_checked_click(params, received, input_guard)
-                    .await,
-                scope,
-                report,
-            ),
+            Ok(scope) => {
+                if let Err(message) = take_input_hold(hold).await {
+                    return (
+                        Json(ActionOutput {
+                            ok: false,
+                            implemented: true,
+                            action: "click".to_string(),
+                            message,
+                            received,
+                        }),
+                        PostActionScope::default(),
+                        None,
+                    );
+                }
+                (
+                    self.dispatch_checked_click(params, received, input_guard)
+                        .await,
+                    scope,
+                    report,
+                )
+            }
             Err(message) => (
                 Json(ActionOutput {
                     ok: false,
@@ -2832,20 +2835,22 @@ impl ComputerUseLinux {
             }
         }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        if let Err(message) = take_input_hold(hold).await {
-            return refused(message);
-        }
         match self.check_element_snapshot(
             "scroll",
             params.snapshot_id.as_deref(),
             scroll_resolves_cached_element(&params),
         ) {
-            Ok(scope) => (
-                self.dispatch_checked_scroll(params, units, received.clone(), input_guard)
-                    .await,
-                scope,
-                report,
-            ),
+            Ok(scope) => {
+                if let Err(message) = take_input_hold(hold).await {
+                    return refused(message);
+                }
+                (
+                    self.dispatch_checked_scroll(params, units, received.clone(), input_guard)
+                        .await,
+                    scope,
+                    report,
+                )
+            }
             Err(message) => refused(message),
         }
     }
@@ -3862,10 +3867,12 @@ impl ComputerUseLinux {
         if env_contains("XDG_CURRENT_DESKTOP", "niri") {
             let key = params.key.clone();
             let this = self.clone();
-            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                this.send_niri_key(&key).await
-            })
-            .await;
+            let (input_guard, result) =
+                run_cancellation_safe_input(
+                    input_guard,
+                    async move { this.send_niri_key(&key).await },
+                )
+                .await;
             let _input_guard = input_guard;
             return Json(ActionOutput {
                 ok: result.is_ok(),
@@ -4220,8 +4227,19 @@ impl ComputerUseLinux {
     }
 
     async fn dispatch_type_text(&self, params: TypeTextParams) -> Json<ActionOutput> {
+        // Reject the whole text up front: chunking would otherwise pass each
+        // piece. Clipboard-routed text has no wtype argv limit.
+        if !wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text) {
+            if let Err(message) = preflight_type_text(&params.text, self.wtype_text_mode()) {
+                let received = Some(serde_json::json!(params.clone()));
+                return Json(action_result("type_text", Err(message), received));
+            }
+        }
         let target = params.window_target();
+        // Hyprland background delivery never moves focus and is batched by its
+        // own backend, so it is neither chunked nor focus-checked per round.
         let chunkable = target.requires_exact_focus()
+            && !hyprland_background_applies(&target)
             && params.text.chars().count() > TYPE_TEXT_FOCUS_CHUNK_CHARS
             && !wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text)
             && !self.should_prefer_kde_clipboard_text_backend();
@@ -4292,7 +4310,9 @@ impl ComputerUseLinux {
         hold: &mut Option<ActiveHold>,
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        if wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text) {
+        if wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text)
+            && !hyprland_background_applies(&params.window_target())
+        {
             let guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
             let this = self.clone();
             let text = params.text.clone();
@@ -9766,13 +9786,12 @@ impl ComputerUseLinux {
                     action_index: action.index,
                 });
             }
-        }
-
-        if is_selectable_item_role(&node.role) {
-            return Ok(ClickTarget::SelectInParent {
-                object_ref: node.object_ref.clone(),
-                fallback: node.bounds.as_ref().and_then(bounds_center),
-            });
+            if is_selectable_item_role(&node.role) {
+                return Ok(ClickTarget::SelectInParent {
+                    object_ref: node.object_ref.clone(),
+                    fallback: node.bounds.as_ref().and_then(bounds_center),
+                });
+            }
         }
 
         if let Some(center) = node.bounds.as_ref().and_then(bounds_center) {
@@ -13778,9 +13797,7 @@ struct ActiveHold {
 /// Take the exclusive input hold. `Err` is the refusal message: input must not
 /// be sent when the hold cannot be taken. `COMPUTER_USE_LINUX_NO_INPUT_HOLD=1`
 /// opts out.
-async fn take_input_hold(
-    hold: Option<&mut Option<ActiveHold>>,
-) -> std::result::Result<(), String> {
+async fn take_input_hold(hold: Option<&mut Option<ActiveHold>>) -> std::result::Result<(), String> {
     if let Some(hold) = hold {
         *hold = Some(begin_input_hold().await?);
     }
@@ -13788,7 +13805,8 @@ async fn take_input_hold(
 }
 
 async fn begin_input_hold() -> std::result::Result<ActiveHold, String> {
-    if env_flag_enabled("COMPUTER_USE_LINUX_NO_INPUT_HOLD") {
+    // Unit tests must never grab the developer's real input devices.
+    if cfg!(test) || env_flag_enabled("COMPUTER_USE_LINUX_NO_INPUT_HOLD") {
         return Ok(ActiveHold {
             hold: None,
             _serial: None,
@@ -13837,7 +13855,10 @@ fn record_focus_before_input(before: Option<WindowInfo>, target_window_id: u64) 
 }
 
 fn take_focus_before_input() -> Option<WindowInfo> {
-    FOCUS_BEFORE_INPUT.lock().ok().and_then(|mut slot| slot.take())
+    FOCUS_BEFORE_INPUT
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
 }
 
 /// Give focus back to the user's window while their devices are still held, so
@@ -13879,7 +13900,10 @@ async fn return_focus_to_user(previous: Option<WindowInfo>) -> Option<String> {
 /// focus first returns to the window they were in.
 async fn release_input_hold(active: ActiveHold) -> String {
     let previous = take_focus_before_input();
-    let user_active = active.hold.as_ref().is_some_and(|hold| hold.saw_user_input());
+    let user_active = active
+        .hold
+        .as_ref()
+        .is_some_and(|hold| hold.saw_user_input());
     let returned = if user_active {
         return_focus_to_user(previous).await
     } else {
@@ -19296,7 +19320,13 @@ esac
             })
             .unwrap();
 
-        assert!(matches!(target, ClickTarget::Coordinates(30, 30)));
+        assert!(matches!(
+            target,
+            ClickTarget::ElementBounds {
+                center: (30, 30),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -19332,7 +19362,8 @@ esac
             }
             ClickTarget::Coordinates(_, _)
             | ClickTarget::ElementBounds { .. }
-            | ClickTarget::ElementPoint { .. } => {
+            | ClickTarget::ElementPoint { .. }
+            | ClickTarget::SelectInParent { .. } => {
                 panic!("expected AT-SPI primary-action fallback")
             }
         }
@@ -20440,7 +20471,8 @@ esac
             }
             ClickTarget::Coordinates(_, _)
             | ClickTarget::ElementBounds { .. }
-            | ClickTarget::ElementPoint { .. } => {
+            | ClickTarget::ElementPoint { .. }
+            | ClickTarget::SelectInParent { .. } => {
                 panic!("expected AT-SPI primary-action fallback")
             }
         }
@@ -21325,7 +21357,8 @@ esac
         assert_eq!(server.wtype_text_mode(), Some(WtypeTextMode::Argument));
         for text in [
             "prefix\0suffix".to_string(),
-            "ş".repeat(WTYPE_MAX_TEXT_BYTES / 2 + 1),
+            // Non-ASCII text goes through the clipboard, which has no argv limit.
+            "a".repeat(WTYPE_MAX_TEXT_BYTES + 1),
         ] {
             let params: TypeTextParams =
                 serde_json::from_value(serde_json::json!({"text": text, "window_id": crate::windowing::types::MAX_WINDOW_ID}))
